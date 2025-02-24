@@ -4,6 +4,7 @@
 	using Microsoft.Extensions.Logging.Abstractions;
 	using System;
 	using System.Buffers;
+	using System.Collections.Generic;
 	using System.Diagnostics;
 	using System.Diagnostics.Metrics;
 	using System.IO;
@@ -18,18 +19,13 @@
 	public class ClamClient : IClamClient
 	{
 
-		public const string ActivitySourceName = "nClam";
 		private readonly ILogger<ClamClient> Logger;
-		static ActivitySource ActivitySource = new ActivitySource(ActivitySourceName, typeof(ClamClient).Assembly.GetName().Version.ToString());
-		static Meter Meter = new Meter(ActivitySourceName, typeof(ClamClient).Assembly.GetName().Version.ToString());
-		static Counter<long> ScannerCounter = Meter.CreateCounter<long>("nclam.scanner.scan_count");
-		static Counter<long> FoundVirusCounter = Meter.CreateCounter<long>("nclam.scanner.found_count");
-		static Histogram<long> ScanningCount = Meter.CreateHistogram<long>("nclam.scanner.duration", description: "Virus scan duration");
+    private int _Foo;
 
-		/// <summary>
-		/// Maximum size (in bytes) which streams will be broken up to when sending to the ClamAV server.  Used in the SendAndScanFile methods.  128kb is the default size.
-		/// </summary>
-		public int MaxChunkSize { get; set; }
+    /// <summary>
+    /// Maximum size (in bytes) which streams will be broken up to when sending to the ClamAV server.  Used in the SendAndScanFile methods.  128kb is the default size.
+    /// </summary>
+    public int MaxChunkSize { get; set; }
 
 		/// <summary>
 		/// Maximum size (in bytes) that can be streamed to the ClamAV server before it will terminate the connection. Used in the SendAndScanFile methods. 25mb is the default size.
@@ -47,9 +43,14 @@
 		public IPAddress? ServerIP { get; set; }
 
 		/// <summary>
-		/// Port which the ClamAV server is listening on
+		/// Get a human readable reference to the server
 		/// </summary>
-		public int Port { get; set; }
+		public string ServerName => ServerIP?.ToString() ?? Server!;
+
+    /// <summary>
+    /// Port which the ClamAV server is listening on
+    /// </summary>
+    public int Port { get; set; }
 
 		private ClamClient(ILogger<ClamClient> logger = null!)
 		{
@@ -58,6 +59,7 @@
 
 			MaxChunkSize = 131072; //128k
 			MaxStreamSize = 26214400; //25mb
+
 		}
 
 		/// <summary>
@@ -92,44 +94,24 @@
 		private async Task<string> ExecuteClamCommandAsync(string command, CancellationToken cancellationToken, Func<Stream, CancellationToken, Task>? additionalCommand = null)
 		{
 
-			var stopWatch = System.Diagnostics.Stopwatch.StartNew();
+			ActivityHelper.BeginClamCommandExecute(command, this);
+
+      var stopWatch = System.Diagnostics.Stopwatch.StartNew();
 
 			string result = string.Empty;
 
 			var clam = new TcpClient(AddressFamily.InterNetwork);
 
-			using var activity = ActivitySource.StartActivity("ExecuteClamCommandAsync", ActivityKind.Client);
-			activity?.SetTag("Command", command);
-			activity?.SetTag("Server", ServerIP?.ToString() ?? Server);
-			activity?.SetTag("Port", Port);
-			if (activity is not null)
-			{
-
-				var displayCommand = command switch
-				{
-					"SCAN" or "INSTREAM" => "Scan",
-					"MULTISCAN" => "Multiple File Scan",
-					_ => command
-				};
-				activity.DisplayName = $"ClamAV {displayCommand}";
-			}
-
-			var scanEvents = new string[] { "SCAN", "INSTREAM", "MULTISCAN" };
-			if (ScannerCounter.Enabled && scanEvents.Contains(command))
-			{
-				ScannerCounter.Add(1);
-			}
-
 			try
 			{
-				Logger.LogDebug($"Connecting to ClamAV server at {ServerIP?.ToString() ?? Server}:{Port}");
+				Logger.LogDebug($"Connecting to ClamAV server at {ServerName}:{Port}");
 				using var stream = await CreateConnection(clam).ConfigureAwait(false);
-				Logger.LogDebug($"Connected to ClamAV server at {ServerIP?.ToString() ?? Server}:{Port}");
+				Logger.LogDebug($"Connected to ClamAV server at {ServerName}:{Port}");
 
 				var commandText = $"z{command}\0";
 				var commandBytes = Encoding.UTF8.GetBytes(commandText);
 				Logger.LogInformation($"Executing command {command}");
-				activity?.AddEvent(new ActivityEvent($"Executing command {command}"));
+				//activity?.AddEvent(new ActivityEvent($"Executing command {command}"));
 
 				await stream.WriteAsync(commandBytes, 0, commandBytes.Length, cancellationToken).ConfigureAwait(false);
 
@@ -140,7 +122,7 @@
 
 				using var reader = new StreamReader(stream);
 				result = await reader.ReadToEndAsync().ConfigureAwait(false);
-				activity?.AddEvent(new ActivityEvent($"Completed command {command}"));
+				//activity?.AddEvent(new ActivityEvent($"Completed command {command}"));
 
 				if (!String.IsNullOrEmpty(result))
 				{
@@ -149,7 +131,7 @@
 				}
 			} catch (Exception ex)
 			{
-				activity?.SetStatus(ActivityStatusCode.Error, $"Error scanning: {ex.Message}");
+				//activity?.SetStatus(ActivityStatusCode.Error, $"Error scanning: {ex.Message}");
 			}
 			finally
 			{
@@ -161,15 +143,29 @@
 			}
 
 			stopWatch.Stop();
-			ScanningCount.Record(stopWatch.ElapsedMilliseconds);
+
+			var scanEvents = new string[] { "SCAN", "INSTREAM", "MULTISCAN" };
+			//if (ScanningCount.Enabled && scanEvents.Contains(command))
+			//{
+
+			//	var tags = new Dictionary<string, object?>();
+			//	if (result.EndsWith("found", StringComparison.InvariantCultureIgnoreCase))
+			//	{
+			//		tags.Add("found", true);
+			//	}
+
+			//	var runTime = stopWatch.Elapsed.TotalSeconds;
+			//	ScanningCount.Record(runTime, tags.ToArray());
+			//	if (activity is not null && result.EndsWith("found", StringComparison.InvariantCultureIgnoreCase)) {
+			//		activity?.AddTag("VirusFound", true);
+			//	}
+
+
+			//}
+
 			Logger.LogDebug("Command {0} took: {1}", command, stopWatch.Elapsed);
-			System.Diagnostics.Debug.WriteLine("Command {0} took: {1}", command, stopWatch.Elapsed);
 
 
-			if (FoundVirusCounter.Enabled && result.EndsWith("found", StringComparison.InvariantCultureIgnoreCase))
-			{
-				FoundVirusCounter.Add(1);
-			}
 
 			return result;
 		}
